@@ -358,6 +358,9 @@ var (
 
 	dirScanMu sync.RWMutex
 	dirScan   map[string]*pkg // abs dir path => *pkg
+
+	localDirScanMu sync.RWMutex
+	localDirScan   map[string][]*pkg // abs dir path => []*pkg
 )
 
 type pkg struct {
@@ -377,6 +380,50 @@ func (s byImportPathShortLength) Less(i, j int) bool {
 
 }
 func (s byImportPathShortLength) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+// bubbleSortLocalPackages will bubble to the top of the list all packages
+// which are local to the package package in pkgDir
+func bubbleSortLocalPackages(pkgDir string, pkgs []*pkg) {
+
+	// find the package path
+	importPath := pkgDirToPkgImportPath(pkgDir)
+	if importPath == "" {
+		return
+	}
+	var top int
+	for i := 0; i < len(pkgs); i++ {
+		if strings.HasPrefix(pkgs[i].importPathShort, importPath) {
+			for j := i; j > top; j-- {
+				pkgs[j], pkgs[j-1] = pkgs[j-1], pkgs[j]
+			}
+			top++
+		}
+	}
+}
+
+// pkgDirToPkgImportPath will attempt to find the package import path for the package
+// in pkgDir.  This is done by assuming pkgDir is in one of build.Default.SrcDirs()
+// directories.
+func pkgDirToPkgImportPath(pkgDir string) (importPath string) {
+	for _, srcDir := range build.Default.SrcDirs() {
+		importPath = strings.TrimPrefix(pkgDir, srcDir+string(os.PathSeparator))
+		if len(importPath) < len(pkgDir) {
+			return filepath.ToSlash(importPath)
+		}
+	}
+	if Debug {
+		log.Printf("pkgDirToPkgImportPath() Failed to find import path of the package containing %s", pkgDir)
+	}
+	return ""
+}
+
+func pkgDirPath(filename string) (pkgDir string, err error) {
+	abs, err := filepath.Abs(filename)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Dir(abs), nil
+}
 
 // gate is a semaphore for limiting concurrency.
 type gate chan struct{}
@@ -579,6 +626,122 @@ func scanGoDirs(goRoot bool) {
 	}
 }
 
+func findImportInLocalGoFiles(pkgDir, filename, pkgName string, symbols map[string]bool) (importPath string, rename, ok bool) {
+	if Debug {
+		log.Printf("scanning for local go files in " + pkgDir)
+		defer log.Printf("scanned for local go files in " + pkgDir)
+	}
+
+	localDirScanMu.Lock()
+	if localDirScan == nil {
+		localDirScan = make(map[string][]*pkg)
+	}
+	lDirScan, found := localDirScan[pkgDir]
+	localDirScanMu.Unlock()
+	if !found {
+		// pkgDir not previously scanned.
+		lDirScan = findCanidates(pkgDir)
+		localDirScanMu.Lock()
+		localDirScan[pkgDir] = lDirScan
+		localDirScanMu.Unlock()
+	}
+
+	var candidates []*pkg
+	for _, pkg := range lDirScan {
+		if pkgIsCandidate(filename, pkgName, pkg) {
+			candidates = append(candidates, pkg)
+		}
+	}
+
+	return walkCandidates(candidates, pkgDir, pkgName, symbols)
+}
+
+func findCanidates(pkgDir string) []*pkg {
+	var candidatesMu sync.Mutex
+	var candidates []*pkg
+
+	walkFn := func(path string, typ os.FileMode) error {
+		if path == pkgDir {
+			return nil
+		}
+		if typ == os.ModeDir {
+			return filepath.SkipDir
+		}
+		if typ.IsRegular() && isGoFile(path) {
+			if Debug {
+				log.Printf("findImportInLocalGoFiles(), path = %s", path)
+			}
+			fileSet := token.NewFileSet()
+			file, err := parser.ParseFile(fileSet, path, nil, parser.Mode(0))
+			if err != nil {
+				if Debug {
+					log.Printf("findImportInLocalGoFiles(): parsing file %v: %v", path, err)
+				}
+				return nil
+			}
+			// collect potential uses of packages.
+			var visitor visitFn
+			visitor = visitFn(func(node ast.Node) ast.Visitor {
+				if node == nil {
+					return visitor
+				}
+				switch v := node.(type) {
+				case *ast.ImportSpec:
+					importpath := strings.Trim(v.Path.Value, `"`)
+					if importpath == "C" {
+						break
+					}
+					dirs := importPathToDirs(importpath, pkgDir)
+					if len(dirs) == 0 {
+						break
+					}
+					for _, dir := range dirs {
+						pkg := &pkg{
+							importPath:      importpath,
+							importPathShort: vendorlessImportPath(importpath),
+							dir:             dir,
+						}
+						candidatesMu.Lock()
+						candidates = append(candidates, pkg)
+						candidatesMu.Unlock()
+					}
+				}
+				return visitor
+			})
+			ast.Walk(visitor, file)
+		}
+		return nil
+	}
+	if err := fastWalk(pkgDir, walkFn); err != nil {
+		if Debug {
+			log.Printf("findImportInLocalGoFiles(): scanning directory %v: %v", pkgDir, err)
+		}
+	}
+	candidatesMu.Lock()
+	defer candidatesMu.Unlock()
+	return candidates
+}
+
+func isGoFile(path string) bool {
+	// ignore non-Go files
+	name := filepath.Base(path)
+	return !strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".go")
+}
+
+// importPathToDirs (when given an import path for a package) finds all directory locations
+// of the package by searching build.Default.SrcDirs() as well as the vendor folder in pkgDir.
+func importPathToDirs(importPath, pkgDir string) (dirs []string) {
+	var dir string
+	for _, srcDir := range append(build.Default.SrcDirs(), filepath.Join(pkgDir, "vendor")) {
+		dir = filepath.Join(srcDir, importPath)
+		if f, err := os.Stat(dir); os.IsNotExist(err) || !f.IsDir() {
+			continue
+		}
+		dirs = append(dirs, dir)
+	}
+	return dirs
+}
+
 // vendorlessImportPath returns the devendorized version of the provided import path.
 // e.g. "foo/bar/vendor/a/b" => "a/b"
 func vendorlessImportPath(ipath string) string {
@@ -695,6 +858,19 @@ func findImportGoPath(pkgName string, symbols map[string]bool, filename string) 
 		defer testMu.RUnlock()
 	}
 
+	pkgDir, err := pkgDirPath(filename)
+	if err != nil {
+		return "", false, err
+	}
+
+	// findImportInLocalGoFiles looks at the import lines for other Go files in the
+	// local directory, since the user is likely to import the same packages
+	// in the current Go file.  If an import is found that satisfies the need,
+	// it will be used over the standard library.
+	if pkg, rename, ok := findImportInLocalGoFiles(pkgDir, filename, pkgName, symbols); ok {
+		return pkg, rename, nil
+	}
+
 	// Fast path for the standard library.
 	// In the common case we hopefully never have to scan the GOPATH, which can
 	// be slow with moving disks.
@@ -711,11 +887,6 @@ func findImportGoPath(pkgName string, symbols map[string]bool, filename string) 
 		// crypto/rand is the safer choice.
 		return "", false, nil
 	}
-
-	// TODO(sameer): look at the import lines for other Go files in the
-	// local directory, since the user is likely to import the same packages
-	// in the current Go file.  Return rename=true when the other Go files
-	// use a renamed package that's also used in the current file.
 
 	// Read all the $GOPATH/src/.goimportsignore files before scanning directories.
 	populateIgnoreOnce.Do(populateIgnore)
@@ -739,12 +910,27 @@ func findImportGoPath(pkgName string, symbols map[string]bool, filename string) 
 			candidates = append(candidates, pkg)
 		}
 	}
+	if pkg, rename, ok := walkCandidates(candidates, pkgDir, pkgName, symbols); ok {
+		return pkg, rename, nil
+	}
+	return "", false, nil
+}
+
+func walkCandidates(candidates []*pkg, pkgDir, pkgName string, symbols map[string]bool) (importPath string, rename, ok bool) {
 
 	// Sort the candidates by their import package length,
 	// assuming that shorter package names are better than long
 	// ones.  Note that this sorts by the de-vendored name, so
 	// there's no "penalty" for vendoring.
 	sort.Sort(byImportPathShortLength(candidates))
+
+	// Sort by bubbling up packages which are local to the package
+	// that contains filename.  It is assumed that a local package
+	// is much more likely to be correct rather then the package
+	// with the shortest name.  The shortest name sort is retained
+	// as the second sort order.
+	bubbleSortLocalPackages(pkgDir, candidates)
+
 	if Debug {
 		for i, pkg := range candidates {
 			log.Printf("%s candidate %d/%d: %v", pkgName, i+1, len(candidates), pkg.importPathShort)
@@ -807,9 +993,9 @@ func findImportGoPath(pkgName string, symbols map[string]bool, filename string) 
 		// If the package name in the source doesn't match the import path's base,
 		// return true so the rewriter adds a name (import foo "github.com/bar/go-foo")
 		needsRename := path.Base(pkg.importPath) != pkgName
-		return pkg.importPathShort, needsRename, nil
+		return pkg.importPathShort, needsRename, true
 	}
-	return "", false, nil
+	return "", false, false
 }
 
 // pkgIsCandidate reports whether pkg is a candidate for satisfying the
