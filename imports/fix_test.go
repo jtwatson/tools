@@ -7,6 +7,7 @@ package imports
 import (
 	"bytes"
 	"flag"
+	"go/ast"
 	"go/build"
 	"io/ioutil"
 	"os"
@@ -822,7 +823,7 @@ func TestFixImports(t *testing.T) {
 	defer func() {
 		findImport = old
 	}()
-	findImport = func(pkgName string, symbols map[string]bool, filename string) (string, bool, error) {
+	findImport = func(pkgName string, symbols map[string]bool, filename string, pkgImports map[string]*ast.ImportSpec) (string, bool, error) {
 		return simplePkgs[pkgName], pkgName == "str", nil
 	}
 
@@ -1023,7 +1024,7 @@ type Buffer2 struct {}
 		}
 		build.Default.GOROOT = goroot
 
-		got, rename, err := findImportGoPath("bytes", map[string]bool{"Buffer2": true}, "x.go")
+		got, rename, err := findImportGoPath("bytes", map[string]bool{"Buffer2": true}, "x.go", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1031,7 +1032,7 @@ type Buffer2 struct {}
 			t.Errorf(`findImportGoPath("bytes", Buffer2 ...)=%q, %t, want "%s", false`, got, rename, bytesPkgPath)
 		}
 
-		got, rename, err = findImportGoPath("bytes", map[string]bool{"Missing": true}, "x.go")
+		got, rename, err = findImportGoPath("bytes", map[string]bool{"Missing": true}, "x.go", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1085,7 +1086,7 @@ func TestFindImportInternal(t *testing.T) {
 			t.Skip(err)
 		}
 
-		got, rename, err := findImportGoPath("race", map[string]bool{"Acquire": true}, filepath.Join(runtime.GOROOT(), "src/math/x.go"))
+		got, rename, err := findImportGoPath("race", map[string]bool{"Acquire": true}, filepath.Join(runtime.GOROOT(), "src/math/x.go"), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1094,7 +1095,7 @@ func TestFindImportInternal(t *testing.T) {
 		}
 
 		// should not be able to use internal from outside that tree
-		got, rename, err = findImportGoPath("race", map[string]bool{"Acquire": true}, filepath.Join(runtime.GOROOT(), "x.go"))
+		got, rename, err = findImportGoPath("race", map[string]bool{"Acquire": true}, filepath.Join(runtime.GOROOT(), "x.go"), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1134,7 +1135,7 @@ func TestFindImportRandRead(t *testing.T) {
 			for _, sym := range tt.syms {
 				m[sym] = true
 			}
-			got, _, err := findImportGoPath("rand", m, file)
+			got, _, err := findImportGoPath("rand", m, file, nil)
 			if err != nil {
 				t.Errorf("for %q: %v", tt.syms, err)
 				continue
@@ -1152,7 +1153,7 @@ func TestFindImportVendor(t *testing.T) {
 			"vendor/golang.org/x/net/http2/hpack/huffman.go": "package hpack\nfunc HuffmanDecode() { }\n",
 		},
 	}.test(t, func(t *goimportTest) {
-		got, rename, err := findImportGoPath("hpack", map[string]bool{"HuffmanDecode": true}, filepath.Join(t.goroot, "src/math/x.go"))
+		got, rename, err := findImportGoPath("hpack", map[string]bool{"HuffmanDecode": true}, filepath.Join(t.goroot, "src/math/x.go"), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1672,4 +1673,44 @@ func TestPkgIsCandidate(t *testing.T) {
 				i, tt.filename, tt.pkgIdent, *tt.pkg, got, tt.want)
 		}
 	}
+}
+
+// Tests that imports in the same package directory are preferred
+func TestPreferPackageImports(t *testing.T) {
+	testConfig{
+		gopathFiles: map[string]string{
+			"foo/foo.go":    "package foo\nimport \"foo/io\"\nconst Z = io.SeekStart\n",
+			"foo/io/bar.go": "package io\nconst SeekStart = 1\n",
+		},
+	}.test(t, func(t *goimportTest) {
+		const in = "package foo\nconst Y = io.SeekStart\n"
+		const want = "package foo\n\nimport \"foo/io\"\n\nconst Y = io.SeekStart\n"
+		buf, err := Process(t.gopath+"/src/foo/x.go", []byte(in), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(buf) != want {
+			t.Errorf("wrong output.\ngot:\n%q\nwant:\n%q\n", buf, want)
+		}
+	})
+}
+
+// Tests that imports are preferred by distance
+func TestPreferCloserDistanceImports(t *testing.T) {
+	testConfig{
+		gopathFiles: map[string]string{
+			"a/b/a/a.go": "package a\nconst X = 1\n",
+			"c/a/a.go":   "package a\nconst X = 1\n",
+		},
+	}.test(t, func(t *goimportTest) {
+		const in = "package b\nconst Y = a.X\n"
+		const want = "package b\n\nimport \"a/b/a\"\n\nconst Y = a.X\n"
+		buf, err := Process(t.gopath+"/src/a/b/b.go", []byte(in), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(buf) != want {
+			t.Errorf("wrong output.\ngot:\n%q\nwant:\n%q\n", buf, want)
+		}
+	})
 }
