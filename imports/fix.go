@@ -125,7 +125,7 @@ func dirPackageInfo(srcDir, filename string) (*packageInfo, error) {
 	return info, nil
 }
 
-func fixImports(fset *token.FileSet, f *ast.File, filename string, pkg *ast.Package) (added []string, err error) {
+func fixImports(fset *token.FileSet, f *ast.File, filename string) (added []string, err error) {
 	// refs are a set of possible package references currently unsatisfied by imports.
 	// first key: either base package (e.g. "fmt") or renamed package
 	// second key: referenced package symbol (e.g. "Println")
@@ -154,11 +154,16 @@ func fixImports(fset *token.FileSet, f *ast.File, filename string, pkg *ast.Pack
 		}
 		switch v := node.(type) {
 		case *ast.ImportSpec:
-			n := getImportName(v, srcDir)
-			if n == "C" {
+			if v.Name != nil {
+				decls[v.Name.Name] = v
 				break
 			}
-			decls[n] = v
+			ipath := strings.Trim(v.Path.Value, `"`)
+			if ipath == "C" {
+				break
+			}
+			local := importPathToName(ipath, srcDir)
+			decls[local] = v
 		case *ast.SelectorExpr:
 			xident, ok := v.X.(*ast.Ident)
 			if !ok {
@@ -210,19 +215,6 @@ func fixImports(fset *token.FileSet, f *ast.File, filename string, pkg *ast.Pack
 		}
 	}
 
-	pkgImports := map[string]*ast.ImportSpec{}
-	if pkg != nil {
-		// collect package imports
-		for _, f := range pkg.Files {
-			for _, i := range f.Imports {
-				n := getImportName(i, srcDir)
-				if n != "C" {
-					pkgImports[n] = i
-				}
-			}
-		}
-	}
-
 	// Search for imports matching potential package references.
 	searches := 0
 	type result struct {
@@ -233,7 +225,7 @@ func fixImports(fset *token.FileSet, f *ast.File, filename string, pkg *ast.Pack
 	results := make(chan result)
 	for pkgName, symbols := range refs {
 		go func(pkgName string, symbols map[string]bool) {
-			ipath, rename, err := findImport(pkgName, symbols, filename, pkgImports)
+			ipath, rename, err := findImport(pkgName, symbols, filename)
 			r := result{ipath: ipath, err: err}
 			if rename {
 				r.name = pkgName
@@ -258,17 +250,6 @@ func fixImports(fset *token.FileSet, f *ast.File, filename string, pkg *ast.Pack
 	}
 
 	return added, nil
-}
-
-func getImportName(v *ast.ImportSpec, srcDir string) string {
-	if v.Name != nil {
-		return v.Name.Name
-	}
-	ipath := strings.Trim(v.Path.Value, `"`)
-	if ipath == "C" {
-		return ipath
-	}
-	return importPathToName(ipath, srcDir)
 }
 
 // importPathToName returns the package name for the given import path.
@@ -714,24 +695,14 @@ func loadExportsGoPath(expectPackage, dir string) map[string]bool {
 // import line:
 // 	import pkg "foo/bar"
 // to satisfy uses of pkg.X in the file.
-var findImport func(pkgName string, symbols map[string]bool, filename string, pkgImports map[string]*ast.ImportSpec) (foundPkg string, rename bool, err error) = findImportGoPath
+var findImport func(pkgName string, symbols map[string]bool, filename string) (foundPkg string, rename bool, err error) = findImportGoPath
 
 // findImportGoPath is the normal implementation of findImport.
 // (Some companies have their own internally.)
-func findImportGoPath(pkgName string, symbols map[string]bool, filename string, pkgImports map[string]*ast.ImportSpec) (foundPkg string, rename bool, err error) {
+func findImportGoPath(pkgName string, symbols map[string]bool, filename string) (foundPkg string, rename bool, err error) {
 	if inTests {
 		testMu.RLock()
 		defer testMu.RUnlock()
-	}
-
-	// look at the import lines for other Go files in the
-	// local directory, since the user is likely to import the same packages
-	// in the current Go file.  Return rename=true when the other Go files
-	// use a renamed package that's also used in the current file.
-	if i := pkgImports[pkgName]; i != nil {
-		ipath := strings.Trim(i.Path.Value, `"`)
-		needsRename := path.Base(ipath) != pkgName
-		return ipath, needsRename, nil
 	}
 
 	// Fast path for the standard library.
@@ -750,6 +721,11 @@ func findImportGoPath(pkgName string, symbols map[string]bool, filename string, 
 		// crypto/rand is the safer choice.
 		return "", false, nil
 	}
+
+	// TODO(sameer): look at the import lines for other Go files in the
+	// local directory, since the user is likely to import the same packages
+	// in the current Go file.  Return rename=true when the other Go files
+	// use a renamed package that's also used in the current file.
 
 	// Read all the $GOPATH/src/.goimportsignore files before scanning directories.
 	populateIgnoreOnce.Do(populateIgnore)

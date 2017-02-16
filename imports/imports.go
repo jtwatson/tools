@@ -18,7 +18,6 @@ import (
 	"go/printer"
 	"go/token"
 	"io"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -50,13 +49,13 @@ func Process(filename string, src []byte, opt *Options) ([]byte, error) {
 	}
 
 	fileSet := token.NewFileSet()
-	file, pkg, adjust, err := parse(fileSet, filename, src, opt)
+	file, adjust, err := parse(fileSet, filename, src, opt)
 	if err != nil {
 		return nil, err
 	}
 
 	if !opt.FormatOnly {
-		_, err = fixImports(fileSet, file, filename, pkg)
+		_, err = fixImports(fileSet, file, filename)
 		if err != nil {
 			return nil, err
 		}
@@ -111,7 +110,7 @@ func Process(filename string, src []byte, opt *Options) ([]byte, error) {
 
 // parse parses src, which was read from filename,
 // as a Go source file or statement list.
-func parse(fset *token.FileSet, filename string, src []byte, opt *Options) (*ast.File, *ast.Package, func(orig, src []byte) []byte, error) {
+func parse(fset *token.FileSet, filename string, src []byte, opt *Options) (*ast.File, func(orig, src []byte) []byte, error) {
 	parserMode := parser.Mode(0)
 	if opt.Comments {
 		parserMode |= parser.ParseComments
@@ -120,36 +119,16 @@ func parse(fset *token.FileSet, filename string, src []byte, opt *Options) (*ast
 		parserMode |= parser.AllErrors
 	}
 
-	// Try entire package
-	dirName := filepath.Dir(filename)
-	var err error
-	var pkg *ast.Package
-	if dirName != "." {
-		pkgs, err := parser.ParseDir(fset, filepath.Dir(filename), nil, parserMode)
-		if err == nil {
-			fname := filepath.Base(filename)
-			for _, p := range pkgs {
-				pkg = p
-				for name, f := range p.Files {
-					if name == fname {
-						return f, p, nil, nil
-					}
-				}
-			}
-		}
-	}
-
 	// Try as whole source file.
 	file, err := parser.ParseFile(fset, filename, src, parserMode)
 	if err == nil {
-		return file, pkg, nil, nil
+		return file, nil, nil
 	}
-
 	// If the error is that the source file didn't begin with a
 	// package line and we accept fragmented input, fall through to
 	// try as a source fragment.  Stop and return on any other error.
-	if !opt.Fragment || err != nil && !strings.Contains(err.Error(), "expected 'package'") {
-		return nil, nil, nil, err
+	if !opt.Fragment || !strings.Contains(err.Error(), "expected 'package'") {
+		return nil, nil, err
 	}
 
 	// If this is a declaration list, make it a source file
@@ -162,7 +141,7 @@ func parse(fset *token.FileSet, filename string, src []byte, opt *Options) (*ast
 		// If a main function exists, we will assume this is a main
 		// package and leave the file.
 		if containsMainFunc(file) {
-			return file, pkg, nil, nil
+			return file, nil, nil
 		}
 
 		adjust := func(orig, src []byte) []byte {
@@ -171,13 +150,13 @@ func parse(fset *token.FileSet, filename string, src []byte, opt *Options) (*ast
 			src = src[len("package main\n"):]
 			return matchSpace(orig, src)
 		}
-		return file, pkg, adjust, nil
+		return file, adjust, nil
 	}
 	// If the error is that the source file didn't begin with a
 	// declaration, fall through to try as a statement list.
 	// Stop and return on any other error.
 	if !strings.Contains(err.Error(), "expected declaration") {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
 	// If this is a statement list, make it a source file
@@ -198,11 +177,11 @@ func parse(fset *token.FileSet, filename string, src []byte, opt *Options) (*ast
 			src = bytes.Replace(src, []byte("\n\t"), []byte("\n"), -1)
 			return matchSpace(orig, src)
 		}
-		return file, pkg, adjust, nil
+		return file, adjust, nil
 	}
 
 	// Failed, and out of options.
-	return nil, nil, nil, err
+	return nil, nil, err
 }
 
 // containsMainFunc checks if a file contains a function declaration with the
