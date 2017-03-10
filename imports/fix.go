@@ -361,15 +361,16 @@ var (
 	dirScan   map[string]*pkg // abs dir path => *pkg
 
 	localDirScanMu sync.RWMutex
-	localDirScan   map[string][]*pkg // abs dir path => []*pkg
+
+	// Holds imported packages found in the Go files for a given abs dir path.
+	localDirScan map[string][]*pkg // abs dir path => []*pkg
 )
 
 type pkg struct {
 	dir             string // absolute file path to pkg directory ("/usr/lib/go/src/net/http")
 	importPath      string // full pkg import path ("net/http", "foo/bar/vendor/a/b")
 	importPathShort string // vendorless import path ("net/http", "a/b")
-
-	distance int // relative distance to target
+	distance        int    // relative distance to target
 }
 
 // byDistanceOrImportPathShortLength sorts by relative distance breaking ties
@@ -400,22 +401,6 @@ func setDistance(pkgDir string, pkg *pkg) {
 			pkg.distance = strings.Count(p, string(filepath.Separator)) + 1
 		}
 	}
-}
-
-// pkgDirToPkgImportPath will attempt to find the package import path for the package
-// in pkgDir.  This is done by assuming pkgDir is in one of build.Default.SrcDirs()
-// directories.
-func pkgDirToPkgImportPath(pkgDir string) (importPath string) {
-	for _, srcDir := range build.Default.SrcDirs() {
-		importPath = strings.TrimPrefix(pkgDir, srcDir+string(os.PathSeparator))
-		if len(importPath) < len(pkgDir) {
-			return filepath.ToSlash(importPath)
-		}
-	}
-	if Debug {
-		log.Printf("pkgDirToPkgImportPath() Failed to find import path of the package containing %s", pkgDir)
-	}
-	return ""
 }
 
 func pkgDirPath(filename string) (pkgDir string, err error) {
@@ -669,39 +654,40 @@ func findCandidates(pkgDir string) []*pkg {
 		if typ == os.ModeDir {
 			return filepath.SkipDir
 		}
-		if typ.IsRegular() && isGoFile(path) {
+		if typ.IsRegular() && strings.HasSuffix(path, ".go") {
 			if Debug {
 				log.Printf("findImportInLocalGoFiles(), path = %s", path)
 			}
 			fileSet := token.NewFileSet()
-			file, err := parser.ParseFile(fileSet, path, nil, parser.Mode(0))
+			file, err := parser.ParseFile(fileSet, path, nil, parser.ImportsOnly)
 			if err != nil {
 				if Debug {
 					log.Printf("findImportInLocalGoFiles(): parsing file %v: %v", path, err)
 				}
-				return err
+				return nil
 			}
 
 			// collect potential uses of packages.
 			for _, v := range file.Imports {
 				importpath := strings.Trim(v.Path.Value, `"`)
 				if importpath == "C" {
-					break
+					continue
 				}
-				dirs := importPathToDirs(importpath, pkgDir)
-				if len(dirs) == 0 {
-					break
-				}
-				for _, dir := range dirs {
-					pkg := &pkg{
-						importPath:      importpath,
-						importPathShort: vendorlessImportPath(importpath),
-						dir:             dir,
+				buildPkg, err := build.Import(importpath, pkgDir, build.FindOnly)
+				if err != nil {
+					if Debug {
+						log.Printf("build.Import(importpath, pkgDir, build.FindOnly): %v", err)
 					}
-					candidatesMu.Lock()
-					candidates = append(candidates, pkg)
-					candidatesMu.Unlock()
+					continue
 				}
+				pkg := &pkg{
+					importPath:      importpath,
+					importPathShort: vendorlessImportPath(importpath),
+					dir:             buildPkg.Dir,
+				}
+				candidatesMu.Lock()
+				candidates = append(candidates, pkg)
+				candidatesMu.Unlock()
 			}
 		}
 		return nil
@@ -714,26 +700,6 @@ func findCandidates(pkgDir string) []*pkg {
 	candidatesMu.Lock()
 	defer candidatesMu.Unlock()
 	return candidates
-}
-
-func isGoFile(path string) bool {
-	// ignore non-Go files
-	name := filepath.Base(path)
-	return !strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".go")
-}
-
-// importPathToDirs (when given an import path for a package) finds all directory locations
-// of the package by searching build.Default.SrcDirs() as well as the vendor folder in pkgDir.
-func importPathToDirs(importPath, pkgDir string) (dirs []string) {
-	var dir string
-	for _, srcDir := range append(build.Default.SrcDirs(), filepath.Join(pkgDir, "vendor")) {
-		dir = filepath.Join(srcDir, importPath)
-		if f, err := os.Stat(dir); os.IsNotExist(err) || !f.IsDir() {
-			continue
-		}
-		dirs = append(dirs, dir)
-	}
-	return dirs
 }
 
 // vendorlessImportPath returns the devendorized version of the provided import path.
